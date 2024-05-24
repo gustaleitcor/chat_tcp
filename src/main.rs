@@ -1,56 +1,79 @@
-use std::{
-    io::{Read, Write},
-    net::{TcpListener, TcpStream},
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+#![feature(new_uninit)]
+#![feature(async_closure)]
 
-fn main() {
-    let server = TcpListener::bind("localhost:6969").expect("ERROR: Could not run server");
-    let streams = Arc::new(Mutex::new(Vec::new()));
+mod client;
+mod message;
+mod server;
 
-    for stream in server.incoming() {
-        match stream {
-            Ok(stream) => {
-                println!("New Connection: {}", stream.peer_addr().unwrap());
+use std::time::Duration;
 
-                let stream = Arc::new(Mutex::new(stream));
+use tokio::{io::AsyncReadExt, sync::mpsc::channel};
 
-                streams.lock().unwrap().push(stream.clone());
+use crate::client::{ClientReader, ClientWriter};
+use crate::message::Message;
+use crate::server::Server;
 
-                let streams_clone = streams.clone();
+#[tokio::main]
+async fn main() {
+    let (server, listener) = Server::new("localhost:5050")
+        .await
+        .expect("ERROR: Could not run server");
 
-                std::thread::spawn(move || {
-                    stream.lock().unwrap().set_nonblocking(true).unwrap();
-                    handle_stream(stream, streams_clone);
-                });
+    println!("  --- Server started ---");
+    println!("Listening to: {}", server.lock().unwrap().get_addr());
+
+    let server_clone = server.clone();
+    let (server_sender, mut server_receiver) = channel::<Message>(1024);
+
+    let incoming_thread = tokio::spawn(async move {
+        loop {
+            let conn = listener.accept().await;
+
+            match conn {
+                Ok((stream, client_addr)) => {
+                    println!("New connection: {client_addr}");
+
+                    let (read_half, write_half) = stream.into_split();
+                    let client_sender_clone = server_sender.clone();
+
+                    let client_writer = ClientWriter::new(client_addr, write_half);
+                    let client_reader =
+                        ClientReader::new(client_addr, read_half, client_sender_clone);
+
+                    server_clone.lock().unwrap().add_client(client_writer);
+
+                    tokio::spawn(async move {
+                        handle_client(client_reader).await;
+                    });
+                }
+                Err(_) => (),
             }
-            Err(_) => (),
         }
+    });
+
+    let server_clone = server.clone();
+
+    loop {
+        let message = server_receiver.recv().await.unwrap();
+        server_clone
+            .clone()
+            .lock()
+            .unwrap()
+            .send_to_all(message)
+            .await;
     }
+
+    incoming_thread.await.unwrap();
 }
 
-fn handle_stream(
-    user_stream: Arc<Mutex<TcpStream>>,
-    streams: Arc<Mutex<Vec<Arc<Mutex<TcpStream>>>>>,
-) {
-    let mut buffer_name = [0; 128];
+async fn handle_client<'a>(mut client: ClientReader<'a>) {
     let mut buffer = [0; 2048];
     let mut buffer_size;
-    let user_addr = user_stream.lock().unwrap().peer_addr().unwrap();
-    let mut response = String::new();
-    let name;
-
-    user_stream
-        .lock()
-        .unwrap()
-        .write("Digite seu apelido: ".as_bytes())
-        .unwrap();
 
     loop {
         std::thread::sleep(Duration::from_millis(100));
 
-        buffer_size = match user_stream.lock().unwrap().read(&mut buffer_name) {
+        buffer_size = match client.get_stream().read(&mut buffer).await {
             Ok(size) => size,
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::WouldBlock {
@@ -59,67 +82,16 @@ fn handle_stream(
                 return;
             }
         };
-        break;
+
+        let msg = String::from_utf8(buffer[0..buffer_size].to_vec()).unwrap();
+
+        client
+            .get_sender()
+            .send(Message {
+                message: msg,
+                adresser: *client.get_addr(),
+            })
+            .await
+            .unwrap();
     }
-
-    name = std::str::from_utf8(&buffer_name[0..buffer_size])
-        .unwrap()
-        .trim();
-
-    loop {
-        std::thread::sleep(Duration::from_millis(100));
-
-        buffer_size = match user_stream.lock().unwrap().read(&mut buffer) {
-            Ok(size) => size,
-            Err(err) => {
-                if err.kind() == std::io::ErrorKind::WouldBlock {
-                    continue;
-                }
-                break;
-            }
-        };
-
-        if buffer_size <= 2 {
-            continue;
-        }
-
-        response.clear();
-        response.push_str(
-            format!(
-                "[{name}] {}",
-                std::str::from_utf8(&buffer[0..buffer_size]).unwrap()
-            )
-            .as_str(),
-        );
-
-        for stream in streams.lock().unwrap().iter() {
-            let mut stream = stream.lock().unwrap();
-
-            match stream.peer_addr() {
-                Ok(addr) => {
-                    if addr == user_addr {
-                        continue;
-                    }
-                }
-                Err(_) => {
-                    continue;
-                }
-            }
-
-            match stream.write(response.as_bytes()) {
-                Ok(_) => (),
-                Err(err) => {
-                    if err.kind() == std::io::ErrorKind::WouldBlock {
-                        continue;
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    println!(
-        "Connection Lost: {}",
-        user_stream.lock().unwrap().peer_addr().unwrap()
-    );
 }
